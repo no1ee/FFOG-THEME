@@ -1,0 +1,15 @@
+{
+  "name": "ffog-theme",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Agentic dashboard that pairs with Claude Code on the local machine",
+  "workspaces": ["backend", "web"],
+  "scripts": {
+    "dev": "concurrently -n backend,web -c blue,magenta \"npm --workspace backend run dev\" \"npm --workspace web run dev\"",
+    "build": "npm --workspace backend run build && npm --workspace web run build",
+    "start": "npm --workspace backend run start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
