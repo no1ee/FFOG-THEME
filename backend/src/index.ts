@@ -81,12 +81,22 @@ app.post("/api/projects/:id/instruction", async (req, res) => {
     res.status(400).json({ error: "prompt required" });
     return;
   }
-  try {
-    const reply = await sessionManager.send(req.params.id, prompt);
-    res.json({ reply });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message ?? String(err) });
+  const { runId, promise } = sessionManager.send(req.params.id, prompt);
+  res.json({ runId });
+  promise.catch(() => {
+    /* errors surface through the WS run.end event */
+  });
+});
+
+app.post("/api/projects/:id/cancel", (req, res) => {
+  const { runId } = (req.body ?? {}) as { runId?: string };
+  let cancelled: string | boolean | null;
+  if (typeof runId === "string" && runId) {
+    cancelled = sessionManager.cancelRun(req.params.id, runId);
+  } else {
+    cancelled = sessionManager.cancelCurrent(req.params.id);
   }
+  res.json({ cancelled });
 });
 
 app.post("/api/projects/:id/check", async (req, res) => {
@@ -146,6 +156,10 @@ function broadcast(msg: unknown): void {
 
 sessionManager.on("event", (event) => {
   broadcast({ type: "event", data: event });
+});
+
+sessionManager.on("stream", (msg) => {
+  broadcast({ type: "stream", data: msg });
 });
 
 scheduler.start();

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -13,9 +14,11 @@ export interface ClaudeSessionOptions {
   transcriptDir: string;
 }
 
-export interface ClaudeStreamEvent {
-  raw: string;
-  parsed: unknown;
+export class CancelledError extends Error {
+  constructor() {
+    super("run cancelled");
+    this.name = "CancelledError";
+  }
 }
 
 /**
@@ -23,7 +26,7 @@ export interface ClaudeStreamEvent {
  *
  * Sanitation guarantees:
  *   - cwd is fixed at construction time and never changed
- *   - sessionId is fixed; we always invoke with --session-id <id> --resume
+ *   - sessionId is fixed; we always invoke with --session-id <id>
  *   - prompts are tagged with [project:<id>] before forwarding
  *   - one prompt at a time per session (queued); no interleaving
  *   - kill() spawns a fresh subprocess on next send (no reuse on suspected contamination)
@@ -38,12 +41,15 @@ export class ClaudeSession extends EventEmitter {
   private readonly transcriptPath: string;
 
   private queue: Array<{
+    runId: string;
     prompt: string;
     resolve: (value: string) => void;
     reject: (err: Error) => void;
   }> = [];
   private busy = false;
+  private currentRunId: string | null = null;
   private currentChild: ChildProcessWithoutNullStreams | null = null;
+  private currentCancelled = false;
 
   constructor(opts: ClaudeSessionOptions) {
     super();
@@ -62,22 +68,63 @@ export class ClaudeSession extends EventEmitter {
     );
   }
 
-  send(prompt: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject });
+  /** Enqueue a prompt. Returns the runId so callers can target cancel(). */
+  enqueue(prompt: string): { runId: string; promise: Promise<string> } {
+    const runId = randomUUID();
+    const promise = new Promise<string>((resolve, reject) => {
+      this.queue.push({ runId, prompt, resolve, reject });
       void this.drain();
     });
+    return { runId, promise };
   }
 
+  /** Convenience for callers that only care about the final text. */
+  send(prompt: string): Promise<string> {
+    return this.enqueue(prompt).promise;
+  }
+
+  /** Cancel a specific run. If it's running, kill the child; if queued, drop it. */
+  cancel(runId: string): boolean {
+    if (this.currentRunId === runId && this.currentChild && !this.currentChild.killed) {
+      this.currentCancelled = true;
+      this.currentChild.kill("SIGTERM");
+      return true;
+    }
+    const idx = this.queue.findIndex((q) => q.runId === runId);
+    if (idx !== -1) {
+      const [item] = this.queue.splice(idx, 1);
+      item.reject(new CancelledError());
+      return true;
+    }
+    return false;
+  }
+
+  /** Cancel whatever is currently in flight (if any). Queue is preserved. */
+  cancelCurrent(): string | null {
+    if (this.currentRunId && this.currentChild && !this.currentChild.killed) {
+      const id = this.currentRunId;
+      this.currentCancelled = true;
+      this.currentChild.kill("SIGTERM");
+      return id;
+    }
+    return null;
+  }
+
+  /** Hard-kill: drop the queue and the in-flight run. */
   kill(): void {
     if (this.currentChild && !this.currentChild.killed) {
+      this.currentCancelled = true;
       this.currentChild.kill("SIGTERM");
     }
     const pending = this.queue.splice(0);
     for (const item of pending) {
-      item.reject(new Error("session killed"));
+      item.reject(new CancelledError());
     }
     this.busy = false;
+  }
+
+  currentRun(): string | null {
+    return this.currentRunId;
   }
 
   private async drain(): Promise<void> {
@@ -85,20 +132,23 @@ export class ClaudeSession extends EventEmitter {
     const next = this.queue.shift();
     if (!next) return;
     this.busy = true;
+    this.currentRunId = next.runId;
+    this.currentCancelled = false;
     try {
-      const result = await this.runOnce(next.prompt);
+      const result = await this.runOnce(next.runId, next.prompt);
       next.resolve(result);
     } catch (err) {
       next.reject(err as Error);
     } finally {
       this.busy = false;
+      this.currentRunId = null;
       if (this.queue.length > 0) {
         void this.drain();
       }
     }
   }
 
-  private runOnce(rawPrompt: string): Promise<string> {
+  private runOnce(runId: string, rawPrompt: string): Promise<string> {
     const taggedPrompt = `[project:${this.projectId}] ${rawPrompt}`;
     const args = [
       "-p",
@@ -110,6 +160,7 @@ export class ClaudeSession extends EventEmitter {
       "--output-format",
       "stream-json",
       "--verbose",
+      "--include-partial-messages",
       "--append-system-prompt",
       this.systemPreamble,
     ];
@@ -128,6 +179,7 @@ export class ClaudeSession extends EventEmitter {
       }
       this.currentChild = child;
       this.emit("spawn", { sessionId: this.sessionId });
+      this.emit("run.start", { runId, prompt: rawPrompt });
 
       const transcript = fs.createWriteStream(this.transcriptPath, {
         flags: "a",
@@ -136,11 +188,13 @@ export class ClaudeSession extends EventEmitter {
         JSON.stringify({
           ts: Date.now(),
           dir: "in",
+          runId,
           prompt: taggedPrompt,
         }) + "\n",
       );
 
       const finalText: string[] = [];
+      let sawDeltas = false;
       let stdoutBuf = "";
       let stderrBuf = "";
 
@@ -158,13 +212,24 @@ export class ClaudeSession extends EventEmitter {
             // ignore non-json
           }
           transcript.write(
-            JSON.stringify({ ts: Date.now(), dir: "out", line: parsed ?? line }) +
+            JSON.stringify({ ts: Date.now(), dir: "out", runId, line: parsed ?? line }) +
               "\n",
           );
-          this.emit("stdout", { raw: line, parsed });
           if (parsed && typeof parsed === "object") {
-            const text = extractAssistantText(parsed);
-            if (text) finalText.push(text);
+            const delta = extractTextDelta(parsed);
+            if (delta) {
+              sawDeltas = true;
+              this.emit("delta", { runId, text: delta });
+            }
+            const finalChunk = extractAssistantText(parsed);
+            if (finalChunk) {
+              finalText.push(finalChunk);
+              // Fallback: if the CLI build doesn't emit partial messages, push
+              // the assistant message as a single delta so the UI still renders.
+              if (!sawDeltas) {
+                this.emit("delta", { runId, text: finalChunk });
+              }
+            }
           }
         }
       });
@@ -178,16 +243,25 @@ export class ClaudeSession extends EventEmitter {
       child.on("error", (err) => {
         transcript.end();
         this.emit("error", err);
+        this.emit("run.end", { runId, ok: false, cancelled: this.currentCancelled });
         reject(err);
       });
 
       child.on("exit", (code, signal) => {
         transcript.end();
+        const cancelled = this.currentCancelled;
         this.currentChild = null;
         this.emit("exit", { code, signal });
+        if (cancelled) {
+          this.emit("run.end", { runId, ok: false, cancelled: true });
+          reject(new CancelledError());
+          return;
+        }
         if (code === 0) {
+          this.emit("run.end", { runId, ok: true, cancelled: false });
           resolve(finalText.join("\n").trim());
         } else {
+          this.emit("run.end", { runId, ok: false, cancelled: false });
           reject(
             new Error(
               `claude exited with code=${code} signal=${signal} stderr=${stderrBuf.slice(0, 500)}`,
@@ -199,6 +273,27 @@ export class ClaudeSession extends EventEmitter {
   }
 }
 
+/**
+ * Pull a token-level text delta from a partial-message stream event, if any.
+ * The CLI emits, e.g.:
+ *   { type: "stream_event", event: { type: "content_block_delta",
+ *     delta: { type: "text_delta", text: "..." } } }
+ */
+function extractTextDelta(msg: any): string | null {
+  if (msg.type !== "stream_event") return null;
+  const ev = msg.event;
+  if (!ev || typeof ev !== "object") return null;
+  if (ev.type === "content_block_delta") {
+    const d = ev.delta;
+    if (d?.type === "text_delta" && typeof d.text === "string") return d.text;
+  }
+  return null;
+}
+
+/**
+ * Pull the *final* assistant text once a complete assistant message arrives,
+ * for transcript / fallback purposes. Partial deltas are handled separately.
+ */
 function extractAssistantText(msg: any): string | null {
   if (msg.type === "assistant" && msg.message?.content) {
     const parts: string[] = [];

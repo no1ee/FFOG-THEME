@@ -35,9 +35,14 @@ export const api = {
   suggestions: (id: string) =>
     jfetch<Suggestion[]>(`/api/projects/${id}/suggestions`),
   sendInstruction: (id: string, prompt: string) =>
-    jfetch<{ reply: string }>(`/api/projects/${id}/instruction`, {
+    jfetch<{ runId: string }>(`/api/projects/${id}/instruction`, {
       method: "POST",
       body: JSON.stringify({ prompt }),
+    }),
+  cancel: (id: string, runId?: string) =>
+    jfetch<{ cancelled: string | boolean | null }>(`/api/projects/${id}/cancel`, {
+      method: "POST",
+      body: JSON.stringify(runId ? { runId } : {}),
     }),
   runCheck: (id: string) =>
     jfetch<{ suggestions: Suggestion[] }>(`/api/projects/${id}/check`, {
@@ -49,11 +54,24 @@ export const api = {
     jfetch<Suggestion>(`/api/suggestions/${id}/reject`, { method: "POST" }),
 };
 
+export type StreamMsg =
+  | { type: "run.start"; projectId: string; runId: string; prompt: string; ts: number }
+  | { type: "delta"; projectId: string; runId: string; text: string; ts: number }
+  | {
+      type: "run.end";
+      projectId: string;
+      runId: string;
+      ok: boolean;
+      cancelled: boolean;
+      ts: number;
+    };
+
 export type WsMessage =
   | { type: "snapshot"; data: { projects: Project[]; suggestions: Suggestion[] } }
   | { type: "event"; data: ProjectEvent }
   | { type: "suggestion"; data: Suggestion }
-  | { type: "project.update"; data: Project };
+  | { type: "project.update"; data: Project }
+  | { type: "stream"; data: StreamMsg };
 
 export function connectWs(onMessage: (msg: WsMessage) => void): () => void {
   const proto = window.location.protocol === "https:" ? "wss" : "ws";

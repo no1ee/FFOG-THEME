@@ -1,19 +1,22 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Project, ProjectEvent, Suggestion } from "../types";
 import { CATEGORY_LABELS } from "../types";
+import type { ActiveRun } from "../App";
 import { api } from "../api";
 
 interface Props {
   project: Project;
   events: ProjectEvent[];
   suggestions: Suggestion[];
+  activeRun: ActiveRun | null;
 }
 
-export function ProjectView({ project, events, suggestions }: Props) {
+export function ProjectView({ project, events, suggestions, activeRun }: Props) {
   const [prompt, setPrompt] = useState("");
-  const [reply, setReply] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const replyRef = useRef<HTMLPreElement | null>(null);
+  const isStreaming = !!activeRun && !activeRun.done;
 
   const pending = useMemo(
     () => suggestions.filter((s) => s.status === "pending"),
@@ -26,27 +29,43 @@ export function ProjectView({ project, events, suggestions }: Props) {
   const recent = useMemo(
     () =>
       suggestions
-        .filter((s) => s.status === "done" || s.status === "failed" || s.status === "rejected")
+        .filter(
+          (s) => s.status === "done" || s.status === "failed" || s.status === "rejected",
+        )
         .slice(0, 8),
     [suggestions],
   );
 
   useEffect(() => {
-    setReply(null);
     setPrompt("");
   }, [project.id]);
 
+  // Auto-scroll the streaming pane.
+  useEffect(() => {
+    const el = replyRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeRun?.text]);
+
   async function send() {
-    if (!prompt.trim() || busy) return;
-    setBusy(true);
+    if (!prompt.trim() || isStreaming) return;
+    const trimmed = prompt.trim();
+    setPrompt("");
     try {
-      const r = await api.sendInstruction(project.id, prompt.trim());
-      setReply(r.reply);
-      setPrompt("");
+      await api.sendInstruction(project.id, trimmed);
     } catch (err: any) {
-      setReply(`Error: ${err.message ?? err}`);
+      alert(`Error: ${err.message ?? err}`);
+    }
+  }
+
+  async function cancel() {
+    if (!isStreaming || cancelling || !activeRun) return;
+    setCancelling(true);
+    try {
+      await api.cancel(project.id, activeRun.runId);
+    } catch (err: any) {
+      alert(`Cancel failed: ${err.message ?? err}`);
     } finally {
-      setBusy(false);
+      setCancelling(false);
     }
   }
 
@@ -127,20 +146,43 @@ export function ProjectView({ project, events, suggestions }: Props) {
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="Tell Claude what you want done in this project…"
             rows={3}
-            className="w-full bg-ink-900 border border-ink-600 rounded px-3 py-2 text-sm font-mono"
+            disabled={isStreaming}
+            className="w-full bg-ink-900 border border-ink-600 rounded px-3 py-2 text-sm font-mono disabled:opacity-50"
           />
-          <div className="flex justify-end mt-2">
-            <button
-              onClick={send}
-              disabled={busy || !prompt.trim()}
-              className="rounded bg-accent-500 hover:bg-accent-600 disabled:opacity-50 text-white px-4 py-2 text-sm font-medium"
-            >
-              {busy ? "Sending…" : "Send"}
-            </button>
+          <div className="flex justify-end gap-2 mt-2">
+            {isStreaming ? (
+              <button
+                onClick={cancel}
+                disabled={cancelling}
+                className="rounded bg-red-600/80 hover:bg-red-600 disabled:opacity-50 text-white px-4 py-2 text-sm font-medium"
+              >
+                {cancelling ? "Cancelling…" : "Cancel"}
+              </button>
+            ) : (
+              <button
+                onClick={send}
+                disabled={!prompt.trim()}
+                className="rounded bg-accent-500 hover:bg-accent-600 disabled:opacity-50 text-white px-4 py-2 text-sm font-medium"
+              >
+                Send
+              </button>
+            )}
           </div>
-          {reply !== null && (
-            <pre className="mt-3 text-xs whitespace-pre-wrap text-ink-200 bg-ink-900 border border-ink-700 rounded p-3 max-h-64 overflow-y-auto">
-              {reply}
+          {activeRun && (
+            <pre
+              ref={replyRef}
+              className="mt-3 text-xs whitespace-pre-wrap text-ink-200 bg-ink-900 border border-ink-700 rounded p-3 max-h-80 overflow-y-auto"
+            >
+              {activeRun.text || (isStreaming ? "…" : "(no output)")}
+              {isStreaming && (
+                <span className="inline-block w-2 h-3 ml-0.5 bg-ink-300 animate-pulse align-baseline" />
+              )}
+              {!isStreaming && activeRun.cancelled && (
+                <span className="block mt-2 text-ink-500">— cancelled —</span>
+              )}
+              {!isStreaming && activeRun.ok === false && !activeRun.cancelled && (
+                <span className="block mt-2 text-red-400">— failed —</span>
+              )}
             </pre>
           )}
         </div>
@@ -153,9 +195,7 @@ export function ProjectView({ project, events, suggestions }: Props) {
         <ul className="space-y-1 text-xs font-mono">
           {events.slice(-30).reverse().map((e) => (
             <li key={e.id} className="text-ink-400">
-              <span className="text-ink-500">
-                {new Date(e.ts).toLocaleTimeString()}
-              </span>{" "}
+              <span className="text-ink-500">{new Date(e.ts).toLocaleTimeString()}</span>{" "}
               <span className="text-ink-200">{e.kind}</span>{" "}
               <span>{summarizePayload(e.payload)}</span>
             </li>

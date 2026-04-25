@@ -78,6 +78,23 @@ You can change either at any time; the next check uses the new setting.
    `auto` — handed straight to the project's worker session. Otherwise they
    wait for an Approve click.
 
+## Live behaviors
+
+- **Token streaming.** Each project's worker is launched with
+  `--include-partial-messages`, and `content_block_delta` events are
+  forwarded over WebSocket as `delta` messages. The UI accumulates them
+  into a streaming reply pane with a blinking caret. If the local `claude`
+  build doesn't emit partials, the backend falls back to forwarding the
+  final assistant message as a single delta so the UI still renders.
+- **Cancel.** While a run is in flight, the Send button becomes Cancel.
+  The backend kills the current child via `SIGTERM` without flushing
+  queued items; cancellation surfaces as `run.end {cancelled: true}`.
+- **Status board.** A flight-board-style strip pinned to the top shows
+  one row per project — always the latest event for that project.
+  Older rows for the same project are replaced, not stacked. The whole
+  panel collapses with a click. Rows highlight briefly when they update,
+  and clicking a row jumps to that project.
+
 ## Notes
 
 - The router session deliberately has no access to project files; it only
@@ -86,3 +103,6 @@ You can change either at any time; the next check uses the new setting.
   hooks you wire up can double-check they're in the right place.
 - Per-project transcripts land in `data/sessions/<projectId>.jsonl` for
   debugging and audit.
+- Two emitter channels keep the event log honest: `event` (persisted in
+  SQLite) carries logical events; `stream` (live-only) carries
+  per-token deltas so the SQLite log doesn't drown in noise.

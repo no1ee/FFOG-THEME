@@ -26,6 +26,8 @@ export type EventKind =
   | "router.dispatch"
   | "claude.stdout"
   | "claude.stderr"
+  | "run.start"
+  | "run.end"
   | "check.start"
   | "check.result"
   | "suggestion.created"

@@ -118,7 +118,7 @@ export async function executeSuggestion(s: Suggestion): Promise<void> {
     title: s.title,
   });
   try {
-    await sessionManager.send(s.projectId, s.proposedPrompt);
+    await sessionManager.send(s.projectId, s.proposedPrompt).promise;
     Registry.setSuggestionStatus(s.id, "done");
   } catch (err: any) {
     Registry.setSuggestionStatus(s.id, "failed");
